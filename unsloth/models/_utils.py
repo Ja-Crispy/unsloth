@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "2025.2.15"
+__version__ = "2025.3.17"
 
 __all__ = [
     "SUPPORTS_BFLOAT16",
@@ -25,7 +25,7 @@ __all__ = [
     "__version__",
     "HAS_FLASH_ATTENTION",
     "HAS_FLASH_ATTENTION_SOFTCAPPING",
-    "PRE_CHECK",
+    "USE_MODELSCOPE",
     "platform_system",
     "patch_tokenizer",
     "get_statistics",
@@ -37,12 +37,11 @@ __all__ = [
     "torch_compile_options",
     "patch_linear_scaling",
     "patch_llama_rope_scaling",
-    "check_nvidia",
     "create_boolean_mask",
     "torch_amp_custom_fwd",
     "torch_amp_custom_bwd",
-    "accelerate_old_send_to_device",
-    "accelerate_new_send_to_device",
+    # "accelerate_old_send_to_device",
+    # "accelerate_new_send_to_device",
     "patch_gradient_accumulation_fix",
     "patch_compiling_bitsandbytes",
     "patch_regional_compilation",
@@ -72,6 +71,8 @@ from typing import Union, Optional, List, Any, Callable, Tuple
 from platform import system as platform_system
 platform_system = platform_system()
 import numpy as np
+import contextlib
+import re
 import warnings, subprocess, re, inspect, psutil, os, math
 from unsloth_zoo.utils import Version
 
@@ -102,6 +103,7 @@ from unsloth_zoo.gradient_checkpointing import (
 from unsloth_zoo.loss_utils import (
     HAS_CUT_CROSS_ENTROPY,
     fused_linear_cross_entropy,
+    _unsloth_get_batch_samples,
 )
 from unsloth_zoo.vision_utils import (
     process_vision_info,
@@ -110,6 +112,14 @@ from unsloth_zoo.compiler import (
     get_transformers_model_type,
     unsloth_compile_transformers as _unsloth_compile_transformers,
 )
+from unsloth_zoo.training_utils import (
+    prepare_model_for_training,
+)
+from unsloth_zoo.temporary_patches import (
+    TEMPORARY_PATCHES,
+)
+for temporary_patch in TEMPORARY_PATCHES:
+    temporary_patch()
 
 # =============================================
 # Disable some warnings which can get annoying
@@ -172,6 +182,43 @@ try:
 except:
     pass
 
+# Gemma3 It is strongly recommended to train Gemma3 models with the `eager`
+try:
+    from transformers.models.gemma3.modeling_gemma3 import logger as gemma3_logger
+    gemma3_logger.addFilter(HideLoggingMessage("strongly recommended"))
+    del gemma3_logger
+except:
+    pass
+
+
+# Patch get_model_param_count to record correct 4bit / 8bit
+from transformers.trainer_pt_utils import is_deepspeed_zero3_enabled
+def get_model_param_count(model, trainable_only = False):
+    """
+    Calculate model's total param count. If trainable_only is True then count only those requiring grads
+    """
+    if is_deepspeed_zero3_enabled():
+        def numel(p):
+            return p.ds_numel if hasattr(p, "ds_numel") else p.numel()
+    else:
+        def numel(p):
+            return p.numel()
+    s = sum(numel(p) for p in model.parameters() if not trainable_only or p.requires_grad)
+    if (not trainable_only) and \
+        hasattr(model, "config") and \
+        hasattr(model.config, "quantization_config"):
+
+        billions = re.findall(r"([0-9]{1,})(?:b|B)", model.config.name_or_path)
+        if len(billions) != 0:
+            billions = int(billions[0])
+            s = 1_000_000_000 * billions
+    pass
+    return s
+pass
+import transformers.trainer_pt_utils
+transformers.trainer_pt_utils.get_model_param_count = get_model_param_count
+import transformers.trainer
+transformers.trainer.get_model_param_count = get_model_param_count
 # =============================================
 
 # =============================================
@@ -243,24 +290,24 @@ pass
 
 # =============================================
 # Fix KeyError: 'Cache only has 0 layers, attempted to access layer with index 0'
-import transformers.cache_utils
-if hasattr(transformers.cache_utils, "DynamicCache") and \
-    transformers.cache_utils.DynamicCache.__getitem__.__name__ != "__cache_utils_getitem__":
+# import transformers.cache_utils
+# if hasattr(transformers.cache_utils, "DynamicCache") and \
+#     transformers.cache_utils.DynamicCache.__getitem__.__name__ != "__cache_utils_getitem__":
 
-    source = inspect.getsource(transformers.cache_utils.DynamicCache.__getitem__)
-    start = source.find("def")
-    spaces = start*" "
-    source = source.split("\n")
-    source = "\n".join(x[start:] for x in source)
-    where = source.find("raise KeyError")
-    source = source[:where] + \
-        f"if len(self) == 0:\n{spaces}{spaces}"\
-        "    raise RuntimeError('Unsloth: You must call `FastLanguageModel.for_inference(model)` before doing inference for Unsloth models.')\n" + \
-        f"{spaces}{spaces}else:\n{spaces}{spaces}{spaces}" + source[where:]
-    source = source.replace("__getitem__", "__cache_utils_getitem__", 1)
-    exec(source)
-    transformers.cache_utils.DynamicCache.__getitem__ = __cache_utils_getitem__
-pass
+#     source = inspect.getsource(transformers.cache_utils.DynamicCache.__getitem__)
+#     start = source.find("def")
+#     spaces = start*" "
+#     source = source.split("\n")
+#     source = "\n".join(x[start:] for x in source)
+#     where = source.find("raise KeyError")
+#     source = source[:where] + \
+#         f"if len(self) == 0:\n{spaces}{spaces}"\
+#         "    raise RuntimeError('Unsloth: You must call `FastLanguageModel.for_inference(model)` before doing inference for Unsloth models.')\n" + \
+#         f"{spaces}{spaces}else:\n{spaces}{spaces}{spaces}" + source[where:]
+#     source = source.replace("__getitem__", "__cache_utils_getitem__", 1)
+#     exec(source)
+#     transformers.cache_utils.DynamicCache.__getitem__ = __cache_utils_getitem__
+# pass
 # =============================================
 
 # =============================================
@@ -413,25 +460,25 @@ pass
 
 # =============================================
 # Fix new Xformers versions TypeError: Multiple dispatch failed for 'torch._ops.aten.to.dtype_layout'
-accelerate_old_send_to_device = None
-accelerate_new_send_to_device = None
-if xformers_version is not None and Version(xformers_version) >= Version("0.0.27"):
-    import accelerate.utils.operations
-    if hasattr(accelerate.utils.operations, "send_to_device") and \
-        accelerate.utils.operations.send_to_device.__name__ != "_fixed_send_to_device":
-        accelerate_old_send_to_device = accelerate.utils.operations.send_to_device
-        from accelerate.utils.operations import *
-        send_to_device = inspect.getsource(accelerate.utils.operations.send_to_device)
-        send_to_device = re.sub(
-            r"([ ]{4,})return tensor\.to\(device\)",
-            r"\1try: return tensor.to(device)\n\1except: return tensor",
-            send_to_device,
-        ).replace("def send_to_device", "def _fixed_send_to_device")
-        exec(send_to_device)
-        # accelerate.utils.operations.send_to_device = _fixed_send_to_device
-        accelerate_new_send_to_device = _fixed_send_to_device
-    pass
-pass
+# accelerate_old_send_to_device = None
+# accelerate_new_send_to_device = None
+# if xformers_version is not None and Version(xformers_version) >= Version("0.0.27"):
+#     import accelerate.utils.operations
+#     if hasattr(accelerate.utils.operations, "send_to_device") and \
+#         accelerate.utils.operations.send_to_device.__name__ != "_fixed_send_to_device":
+#         accelerate_old_send_to_device = accelerate.utils.operations.send_to_device
+#         from accelerate.utils.operations import *
+#         send_to_device = inspect.getsource(accelerate.utils.operations.send_to_device)
+#         send_to_device = re.sub(
+#             r"([ ]{4,})return tensor\.to\(device\)",
+#             r"\1try: return tensor.to(device)\n\1except: return tensor",
+#             send_to_device,
+#         ).replace("def send_to_device", "def _fixed_send_to_device")
+#         exec(send_to_device)
+#         # accelerate.utils.operations.send_to_device = _fixed_send_to_device
+#         accelerate_new_send_to_device = _fixed_send_to_device
+#     pass
+# pass
 
 # Transformers 4.46 breaks dynamic caching. This is a hack
 import transformers.generation.configuration_utils
@@ -510,67 +557,16 @@ def prepare_model_for_kbit_training(
     use_gradient_checkpointing : Optional = True,
     use_reentrant              : Optional[bool] = True,
 ) -> Any:
-    """
-    Calculates where to place the gradient checkpoints given n_layers.
-    We also freeze all other layers's gradients
-
-    Args:
-        model: Any LlamaModel with layers.
-        use_gradient_checkpointing (`bool`, *optional*):
-            Default enabled. Provides memory savings by not saving all activations,
-            but only some.
-        use_reentrant (`bool`, *optional*):
-            https://github.com/pytorch/pytorch/blob/main/torch/utils/checkpoint.py#L354
-            Optimal gradient checkpointing algorithm which will be the default in
-            future Pytorch versions.
-    """
-
-    # Freeze all parameters except LoRA
-    with torch.no_grad():
-        for name, param in model.named_parameters():
-            if ".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name:
-                param.requires_grad_(True)
-                # Also must be in float32!
-                if param.dtype != torch.float32:
-                    name = name.replace("base_model", "model", 1)
-                    layer_number = re.search(r"\.[\d]{1,}\.", name).group(0)
-                    name = name.replace(layer_number, f"[{layer_number[1:-1]}].")
-                    name = name.replace(".weight", "", 1)
-                    exec(f"{name}.to(torch.float32)")
-                pass
-            else:
-                param.requires_grad_(False)
-        pass
-    pass
-
-    # Gradient checkpointing!
-    if use_gradient_checkpointing == "unsloth":
-
-        # Saves VRAM!
-        original_model = model
-        while hasattr(original_model, "model"):
-            original_model._offloaded_gradient_checkpointing = True
-            original_model = original_model.model
-        pass
-        original_model._offloaded_gradient_checkpointing = True
-        
-        model.gradient_checkpointing_enable()
-
-    elif use_gradient_checkpointing == True:
-        model.gradient_checkpointing_enable()
-    pass
-
-    # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
-    if use_reentrant:
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-        else:
-            def make_inputs_require_grad(module, input, output):
-                output.requires_grad_(True)
-            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-    pass
-
-    return model
+    return prepare_model_for_training(
+        model                      = model,
+        use_gradient_checkpointing = use_gradient_checkpointing,
+        use_reentrant              = use_reentrant,
+        full_finetuning            = False,
+        train_layernorms           = False,
+        train_embedding            = False,
+        train_lm_head              = False,
+        float32_mixed_precision    = True,
+    )
 pass
 
 # =============================================
@@ -703,9 +699,7 @@ pass
 # =============================================
 # Fixes Bitsandbytes to remove missing warnings
 from transformers.utils.quantization_config import BitsAndBytesConfig, QuantizationMethod
-from inspect import getsource
-from accelerate.utils.dataclasses import DistributedType
-BitsAndBytesConfig__init__ = getsource(BitsAndBytesConfig.__init__)
+BitsAndBytesConfig__init__ = inspect.getsource(BitsAndBytesConfig.__init__)
 BitsAndBytesConfig__init__ = re.sub(
     r"if[\s]{1,}kwargs\:[\s]{1,}.+?\n",
     "",
@@ -719,27 +713,29 @@ BitsAndBytesConfig__init__ = BitsAndBytesConfig__init__.replace(
     "__init__",
     "_BitsAndBytesConfig__init__",
 )
-
-def _prepare_backend(
-    self, cpu = False, sagemaker_dp = False, backend: str = None,
-) -> tuple[str, DistributedType]:
-    return None, DistributedType.NO
-pass
-import accelerate.state
-accelerate.state.PartialState._prepare_backend = _prepare_backend
-
-import accelerate.accelerator
-prepare = inspect.getsource(accelerate.accelerator.Accelerator.prepare)
-prepare = prepare.split("\n")
-spaces = prepare[0].find("def")
-prepare = "\n".join(x[spaces:] for x in prepare)
-x = "for obj in args:"
-s = " "*spaces
-prepare = prepare.replace(x, f'self.state.distributed_type = DistributedType.NO\n{s}{x}', 1)
-exec(prepare, globals())
-accelerate.accelerator.Accelerator.prepare = prepare
-
 exec(BitsAndBytesConfig__init__, globals())
+
+if torch.cuda.device_count() == 1:
+    from accelerate.utils.dataclasses import DistributedType
+    def _prepare_backend(
+        self, cpu = False, sagemaker_dp = False, backend: str = None,
+    ) -> tuple[str, DistributedType]:
+        return None, DistributedType.NO
+    pass
+    import accelerate.state
+    accelerate.state.PartialState._prepare_backend = _prepare_backend
+
+    import accelerate.accelerator
+    prepare = inspect.getsource(accelerate.accelerator.Accelerator.prepare)
+    prepare = prepare.split("\n")
+    spaces = prepare[0].find("def")
+    prepare = "\n".join(x[spaces:] for x in prepare)
+    x = "for obj in args:"
+    s = " "*spaces
+    prepare = prepare.replace(x, f'self.state.distributed_type = DistributedType.NO\n{s}{x}', 1)
+    exec(prepare, globals())
+    accelerate.accelerator.Accelerator.prepare = prepare
+pass
 
 import transformers.utils.quantization_config
 transformers.utils.quantization_config.BitsAndBytesConfig.__init__ = _BitsAndBytesConfig__init__
@@ -757,7 +753,8 @@ def offload_to_disk(W, model, name, temporary_location : str = "_unsloth_tempora
     filename = os.path.join(file_location, f"{name}.pt")
     W = W.weight if hasattr(W, "weight") else W
     torch.save(W, filename, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL,)
-    offloaded_W = torch.load(filename, map_location = "cpu", mmap = True)
+    # We must use weights_only = False due to pickling
+    offloaded_W = torch.load(filename, map_location = "cpu", mmap = True, weights_only = False)
     offloaded_W._offloaded_file_location = filename
     return offloaded_W
 pass
@@ -963,21 +960,6 @@ def patch_llama_rope_scaling(
 pass
 
 
-def check_nvidia():
-    # Unsloth doesn't work yet on AMD devices - we're working on it!
-    output = np.array([0,])
-    try:
-        output = subprocess.check_output("nvidia-smi --query-gpu=memory.used --format=csv", shell = True)
-        output = re.findall(rb'([\d]{1,})[\s]{1,}M', output)
-        output = np.array([int(x.decode('utf-8'))/1024 for x in output])
-    except:
-        if not torch.cuda.is_available():
-            raise RuntimeError("Unsloth: We do not support AMD / Intel machines yet - it is a work in progress!")    
-    return output
-pass
-PRE_CHECK = check_nvidia()
-
-
 def create_boolean_mask(n = 4096, sliding_window = 2048):
     # Creates a boolean mask for attention
     mask = torch.ones(n, n, dtype = torch.bool)
@@ -1015,44 +997,6 @@ def test_mask_creation():
 pass
 
 
-def _unsloth_get_batch_samples(self, epoch_iterator, num_batches):
-    batch_samples = []
-    num_items_in_batch = None
-
-    # Check if model allows **kwargs
-    model = self.model
-    f = model.base_model.model.forward if hasattr(model, "base_model") else model.forward
-    has_kwargs = tuple(inspect.signature(f).parameters.values())[-1].kind == inspect._VAR_KEYWORD
-
-    # Iterate to find all batches
-    for _ in range(num_batches):
-        try:
-            batch_samples += [next(epoch_iterator)]
-        except StopIteration:
-            break
-    pass
-
-    # Get num_items_in_batch
-    if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
-        try:
-            num_items_in_batch = sum(
-                [(x["labels"][..., 1:] != -100).sum() for x in batch_samples]
-            )
-            
-            if self.args.average_tokens_across_devices:
-                num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum().item()
-
-            if torch.is_tensor(num_items_in_batch):
-                num_items_in_batch = num_items_in_batch.item()
-
-        except Exception as exception:
-            logger.warning_once(exception)
-    pass
-
-    return batch_samples, num_items_in_batch
-pass
-
-
 def _unsloth_pre_compute_loss(self, model, inputs, *args, **kwargs):
     num_items_in_batch = None
 
@@ -1066,15 +1010,23 @@ def _unsloth_pre_compute_loss(self, model, inputs, *args, **kwargs):
         pass
     pass
 
-    if num_items_in_batch is None:
-        name = (model.base_model.model if hasattr(model, "base_model") else model).__class__.__name__
+    # Get gradient accumulation steps if possible
+    if num_items_in_batch is None and \
+        getattr(getattr(self, "args", self), "gradient_accumulation_steps", 1) != 1:
+
+        inner_model = model
+        if hasattr(inner_model, "base_model"): inner_model = inner_model. base_model
+        if hasattr(inner_model, "model"): inner_model = inner_model.model
+        name = inner_model.__class__.__name__
+
         logger.warning_once(
             f"Unsloth: Not an error, but {name} does not accept `num_items_in_batch`.\n"\
             "Using gradient accumulation will be very slightly less accurate.\n"\
             "Read more on gradient accumulation issues here: https://unsloth.ai/blog/gradient"
         )
     pass
-    return self._old_compute_loss(model, inputs, *args, **kwargs)
+    outputs = self._old_compute_loss(model, inputs, *args, **kwargs)
+    return outputs
 pass
 
 
@@ -1122,8 +1074,6 @@ def patch_gradient_accumulation_fix(Trainer):
     items_in_trainer = dir(transformers.trainer)
     good_items = []
     for item in items_in_trainer:
-        # TODO: Support Deepspeed
-        if item.startswith(("deepspeed", "xm", "met", "smp")): continue
         if item in function: good_items.append(item)
     pass
     exec("from transformers.trainer import (" + ", ".join(x for x in good_items) + ")", globals())
@@ -1179,7 +1129,9 @@ pass
 
 
 def unsloth_compile_transformers(
+    dtype,
     model_name,
+    model_types,
     token                   = None,
     revision                = None,
     trust_remote_code       = False,
@@ -1217,16 +1169,15 @@ def unsloth_compile_transformers(
         )
         return
     pass
-
-    model_types = get_transformers_model_type(
-        model_name        = model_name,
-        token             = token,
-        revision          = revision,
-        trust_remote_code = trust_remote_code,
-    )
-
+    if trust_remote_code:
+        print(
+            "Unsloth: We can't trace models if `trust_remote_code = True`, "\
+            "so turning off some optimizations!"
+        )
+        return
     if disable: return
 
+    model_types = list(dict().fromkeys(model_types).keys())
     for model_type in model_types:
         _unsloth_compile_transformers(
             model_type,
@@ -1256,6 +1207,9 @@ def unsloth_compile_transformers(
             return_logits          = return_logits,
         )
     pass
+    # Redo patches which override compiler
+    for temporary_patch in TEMPORARY_PATCHES:
+        temporary_patch()
     return model_types
 pass
 
@@ -1263,10 +1217,11 @@ pass
 # os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
 LOGITS_ERROR_STRING = \
     "Unsloth: Logits are empty from 2024.11 onwards. To get raw logits again, please "\
-    'set the environment variable `UNSLOTH_RETURN_LOGITS` to `"1" BEFORE starting to train ie before `trainer.train()`. For example:\n\n'\
-    "import os\n"\
+    'set the environment variable `UNSLOTH_RETURN_LOGITS` to `"1" BEFORE starting to train ie before `trainer.train()`. For example:\n'\
+    "```\nimport os\n"\
     "os.environ['UNSLOTH_RETURN_LOGITS'] = '1'\n"\
-    "... trainer.train() ..."
+    "trainer.train()\n```\n"\
+    "No need to restart your console - just add `os.environ['UNSLOTH_RETURN_LOGITS'] = '1'` before trainer.train() and re-run the cell!"
 
 def raise_logits_error(*args, **kwargs): raise NotImplementedError(LOGITS_ERROR_STRING)
 def return_none(*args, **kwargs): return None
@@ -1285,4 +1240,11 @@ for j, function in enumerate(functions):
         exec(f"def raise_{j}(*args, **kwargs): print('{function}')", globals(), locals())
         try: exec(f"EMPTY_LOGITS.{function} = raise_{j}", globals(), locals())
         except: continue
+pass
+
+USE_MODELSCOPE = os.environ.get("UNSLOTH_USE_MODELSCOPE", "0") == "1"
+if USE_MODELSCOPE:
+    if importlib.util.find_spec("modelscope") is None:
+        raise ImportError(f'You are using the modelscope hub, please install modelscope by `pip install modelscope -U`')
+    pass
 pass

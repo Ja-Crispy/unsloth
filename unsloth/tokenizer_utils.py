@@ -686,12 +686,12 @@ def fix_chat_template(tokenizer):
                 raise RuntimeError(
                     f"Unsloth: The tokenizer `{tokenizer.name_or_path}`\n"\
                     "does not have a {% if add_generation_prompt %} for generation purposes.\n"\
-                    "Please file a bug report immediately - thanks!"
+                    f"Please file a bug report to the maintainers of `{tokenizer.name_or_path}` - thanks!"
                 )
             else:
                 logger.warning_once(
                     "Unsloth: We successfully patched the tokenizer to add a {% if add_generation_prompt %} to the chat_template.\n"\
-                    "This is not a bug, but please notify the Unsloth maintainers - thanks!"
+                    f"This is not a bug, but please notify the maintainers of `{tokenizer.name_or_path}` - thanks!"
                 )
                 chat_template = new_chat_template
             pass
@@ -857,23 +857,9 @@ def check_tokenizer(
 pass
 
 
-def check_nvidia():
-    # Unsloth doesn't work yet on AMD devices - we're working on it!
-    output = np.array([0,])
-    try:
-        output = subprocess.check_output("nvidia-smi --query-gpu=memory.used --format=csv", shell = True)
-        output = re.findall(rb'([\d]{1,})[\s]{1,}M', output)
-        output = np.array([int(x.decode('utf-8'))/1024 for x in output])
-    except:
-        if not torch.cuda.is_available():
-            raise RuntimeError("Unsloth: We do not support AMD / Intel machines yet - it is a work in progress!")
-    return output
-pass
-PRE_CHECK = check_nvidia()
-
-
 import inspect
 from inspect import getsource
+import trl
 import trl.trainer.sft_trainer
 from trl.trainer.sft_trainer import *
 from transformers.trainer import *
@@ -959,7 +945,7 @@ def patch_sft_trainer_tokenizer():
         if replacer is None:
             # .*? matches first match. .+? matches final match.
             replacer = re.findall(
-                f"def {function_name}\(.*?\).*?\:\n",
+                f"def {function_name}" + r"\(.*?\).*?\:\n",
                 function,
                 flags = re.MULTILINE | re.DOTALL,
             )
